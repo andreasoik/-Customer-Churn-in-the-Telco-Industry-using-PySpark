@@ -1,0 +1,377 @@
+import pyspark.sql.functions as f
+from pyspark.ml.feature import PCA, VectorAssembler,StandardScaler
+from pyspark.ml.regression import LinearRegression
+from pyspark.ml.evaluation import RegressionEvaluator
+import pyspark.sql.functions as f
+import pyspark.sql.functions as f
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.evaluation import RegressionEvaluator
+import sklearn.metrics
+from pyspark.ml.clustering import GaussianMixture
+from pyspark.ml.clustering import KMeans, KMeansModel
+from pyspark.ml.evaluation import ClusteringEvaluator
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.feature import IndexToString,StringIndexer, VectorIndexer
+from pyspark.ml.classification import NaiveBayes
+from pyspark.ml.classification import GBTClassifier
+from pyspark.ml.classification import RandomForestClassifier
+from pyspark.ml.classification import DecisionTreeClassifier
+from pyspark.ml.evaluation import BinaryClassificationEvaluator, MulticlassClassificationEvaluator
+from pyspark.ml.classification import  LogisticRegression
+import re
+from pyspark.ml.regression import GBTRegressor
+from pyspark.ml.regression import RandomForestRegressor
+#Gaussian Mixrure
+from functools import reduce
+from pyspark.sql import SparkSession
+import numpy as np
+from pyspark.sql.functions import regexp_replace
+from pyspark.ml.evaluation import RegressionEvaluator
+import pandas as pd
+import os
+
+spark = SparkSession\
+    .builder.appName("MachineLearningTesting")\
+    .master("local[*]")\
+    .getOrCreate()
+df_pyspark=spark.read.csv('churn.csv',header=True,inferSchema=True)
+
+oldcolumns=df_pyspark.columns
+newcolumns=pd.Series(df_pyspark.columns).str.lower().str.replace(' ','_').tolist()
+
+df_pyspark=reduce(lambda df, 
+      i: df.withColumnRenamed(oldcolumns[i],newcolumns[i]),range(len(oldcolumns)),df_pyspark)
+mapping={'account_length':'account_len',"int'l_plan":'intl_plan','eve_mins':'evening_mins','eve_calls':'evening_calls',
+         'eve_charge': 'evening_charge', 'churn?':'churn'}
+
+newcol=[mapping.get(x,x) for x in df_pyspark.columns]
+df_pyspark.toDF(*newcol).toPandas()
+df_pyspark=df_pyspark.toDF(*newcol)
+
+# convert strings to upper and making any neccesary correction
+
+df_pyspark=df_pyspark.withColumn("churn",f.regexp_replace("churn","\.",""))
+
+upperlist=[col[0] for col in df_pyspark.dtypes if col[1]=='string']
+
+df_pyspark=reduce(lambda df,colname:
+   df.withColumn(colname,f.upper(f.col(colname))),upperlist,df_pyspark)
+
+df_pyspark.toPandas()
+
+#PCA
+col=[item[0] for item in df_pyspark.dtypes if not(item[1].startswith('string'))]
+
+featureassembler=VectorAssembler(inputCols=col,outputCol='features')
+assembler_df=featureassembler.transform(df_pyspark)
+
+scaler=StandardScaler(inputCol='features',outputCol='features_scaled',withStd=True,withMean=False)
+scaled_df=scaler.fit(assembler_df).transform(assembler_df)
+
+pca=PCA(k=len(col),inputCol='features',outputCol='pca_features')
+model=pca.fit(scaled_df)
+
+print(model.explainedVariance.round(3)*100)
+print(model.explainedVariance.cumsum().round(3)*100)
+
+pca=PCA(k=4,inputCol='features',outputCol='pca_features')
+model=pca.fit(scaled_df)
+
+pca_df=model.transform(scaled_df)
+
+pca_df.select('pca_features').show(truncate=False)
+
+pca_df=pca_df.withColumn('total_charge',
+                         sum([f.col(colname) for colname in df_pyspark.columns if '_charge' in colname]))
+
+df=pca_df.join(df_pyspark.groupBy('phone').pivot('state').agg(f.count('*')).fillna(0),
+             ['phone'],how='inner')
+
+
+listcol=['pca_features']
+listcol.extend(state_cols)
+
+state_cols=[x[0] for x in df_pyspark.select('state').distinct().collect()]
+featureassembler=VectorAssembler(inputCols=listcol,outputCol='final_features')
+
+df=featureassembler.transform(df)
+(train_data,test_data)= df.randomSplit([0.7,0.3])
+
+#Linear Regression
+
+lm=LinearRegression(featuresCol='final_features',labelCol='total_charge')
+model=lm.fit(train_data)
+
+def modelsummary(model):
+    print("##","-------------------------------------------------")
+    print("##","  Estimate  | Std.Error  | t-statistic  | p-value")
+    coef=np.append(list(model.coefficients),model.intercept)
+    Summary=model.summary
+    
+    for i in range(len(Summary.pValues)):
+        print("##",'{:9.2f}'.format(coef[i]),\
+             '{:12.2f}'.format(Summary.coefficientStandardErrors[i]),
+             '{:12.2f}'.format(Summary.tValues[i]),\
+             '{:12.2f}'.format(Summary.pValues[i]))
+        
+    print("##",'--------------')
+        
+    print("##","Mean squared error: %.5f" % Summary.meanSquaredError,\
+    "RMSE: %1.5f" % Summary.rootMeanSquaredError)
+    print("##",'Multiple R-squared: %1.5f' % Summary.r2)
+        
+modelsummary(model)
+
+predictions=model.transform(test_data)
+predictions.select('features','total_charge','prediction')
+
+
+evaluator=RegressionEvaluator(labelCol='total_charge',
+                             predictionCol="prediction",
+                             metricName='rmse')
+
+evaluator.evaluate(predictions)
+
+
+#DecisionTreeRegressor
+listcol=[col for col in df_pyspark.columns if '_charge' in col]
+df_pyspark=df_pyspark.withColumn('total_charge',sum([f.col(colname) for colname in listcol]))
+
+listcol=[x for x in df_pyspark.columns if re.compile('^.*_calls|mins$').search(x)]
+featureassembler=VectorAssembler(inputCols=listcol,outputCol='features_dt')
+df_pyspark=featureassembler.transform(df_pyspark)
+df_pyspark.toPandas()
+
+train_data,test_data=df_pyspark.randomSplit([0.7,0.3])
+
+from pyspark.ml.regression import DecisionTreeRegressor
+dt=DecisionTreeRegressor(featuresCol='features_dt',labelCol='total_charge')
+model=dt.fit(train_data)
+
+predictions=model.transform(test_data)
+evaluator=RegressionEvaluator(labelCol='total_charge',predictionCol='prediction',metricName='mae')
+evaluator.evaluate(predictions)
+
+y_true = predictions.select("total_charge").toPandas()
+y_pred = predictions.select("prediction").toPandas()
+
+r2_score = sklearn.metrics.r2_score(y_true, y_pred)
+print(f'r2_score: {r2_score:.3f}\n')
+
+imp=model.featureImportances
+listcol=[x for x in df_pyspark.columns if re.compile('^.*_calls|mins$').search(x)]
+
+for name,value in zip(listcol,imp):
+    print(name,value)
+
+
+#RandomForestRegressor
+
+listcol=[x for x in df_pyspark.columns if re.compile('^.*_calls|mins$').search(x)]
+df_pyspark=df_pyspark.withColumn('churn',f.when(f.col('churn').isin('TRUE'), 1).when(f.col('churn').isin('FALSE'), 0))
+listcol=np.append(listcol,'churn')
+featureassembler=VectorAssembler(inputCols=list2,outputCol='features_dr')
+df_pyspark=featureassembler.transform(df_pyspark)
+
+train_data,test_data=df_pyspark.randomSplit([0.7,0.3])
+rf=RandomForestRegressor(featuresCol='features_dr',labelCol='total_charge',
+                         maxDepth=5,minInstancesPerNode=round(df_pyspark.count()*0.1))
+model=rf.fit(train_data)
+predictions=model.transform(test_data)
+predictions.select('features_dr','total_charge','prediction').show()
+
+evaluator=RegressionEvaluator(labelCol='total_charge',predictionCol="prediction",metricName='mae')
+evaluator.evaluate(predictions)
+
+imp=model.featureImportances
+for name,value in zip(listcol,imp):
+    print(name,':',value)
+
+#GBTRegressor
+rf=GBTRegressor(featuresCol='features_dr',labelCol='total_charge',
+                         maxDepth=5,minInstancesPerNode=round(df_pyspark.count()*0.1))
+model=rf.fit(train_data)
+predictions=model.transform(test_data)
+evaluator=RegressionEvaluator(labelCol='total_charge',predictionCol='prediction')
+evaluator.evaluate(predictions)
+
+imp=model.featureImportances
+indices=np.argsort(imp)
+sort_imp=sorted(imp,reverse=True)
+for name,value in zip(listcol[indices],sort_imp):
+    print(name,':',f'{value:.4f}')
+
+#LogisticRegressor
+listcol=[x for x in df_pyspark.columns if re.compile('^._calls|_mins|_charge').search(x)]
+featureassembler=VectorAssembler(inputCols=listcol,outputCol='features_clf')
+df_pyspark=featureassembler.transform(df_pyspark)
+df_pyspark=df_pyspark.withColumn('churn',f.when(f.col('churn').isin('TRUE'), 1).when(f.col('churn').isin('FALSE'), 0))
+
+logr=LogisticRegression(featuresCol='features_clf',labelCol='churn')
+(train_data,test_data)=df_pyspark.randomSplit([0.7,0.3],seed=42)
+model=logr.fit(train_data)
+predictions=model.transform(test_data)
+predictions.select('features_clf','churn','prediction').show()
+
+df_pyspark.groupBy('churn').count().withColumn('PRC_count',f.col('count')/df_pyspark.count()).show()
+
+
+
+evaluator=MulticlassClassificationEvaluator(labelCol='churn',predictionCol='prediction',
+                                            metricName='accuracy')
+
+multiclass_metrics=['accuracy','weightedRecall','weightedPrecision','f1']
+for metric in multiclass_metrics:
+    result=evaluator.evaluate(predictions,{evaluator.metricName:metric})
+    print(f'Metrics {metric}: {result:.4f}')
+
+evaluator=BinaryClassificationEvaluator(labelCol='churn',rawPredictionCol='prediction')
+binary_metrics=['areaUnderROC','areaUnderPR']
+for metric in binary_metrics:
+    result=evaluator.evaluate(predictions,{evaluator.metricName: metric})
+    print(f'Binary {metric}: {result:.4f}')
+
+
+predictions.groupBy('prediction').count().withColumn('PRC',f.col('count')/predictions.count()).show()
+
+trainingSummary=model.summary
+trainingSummary.roc.show(5)
+print("areaUnderROC: " + str(trainingSummary.areaUnderROC))
+fMeasure = trainingSummary.fMeasureByThreshold
+maxFMeasure = fMeasure.groupBy().max('F-Measure').select('max(F-Measure)').head(5)
+print(maxFMeasure)
+
+#DecisionTreeClassifier
+dtre=DecisionTreeClassifier(featuresCol='features_clf',labelCol='churn',
+                            maxDepth=5,minInstancesPerNode=round(df_pyspark.count()*0.01))
+model=dtre.fit(train_data)
+predictions=model.transform(test_data)
+evaluator=MulticlassClassificationEvaluator(labelCol='churn',predictionCol='prediction',metricName='accuracy')
+multiclass_metrics=['accuracy','weightedRecall','weightedPrecision','f1']
+
+or metric in multiclass_metrics:
+    result=evaluator.evaluate(predictions,{evaluator.metricName: metric})
+    print(f'Metric {metric}: {result}')
+    
+evaluator=BinaryClassificationEvaluator(labelCol='churn',rawPredictionCol='prediction')
+binary_metrics=['areaUnderROC','areaUnderPR']
+print('\n')
+for metric in binary_metrics:
+    result=evaluator.evaluate(predictions,{evaluator.metricName: metric})
+    print(f'Binary {metric}: {result:.4f}')
+
+#RandomForestClassifier
+rf=RandomForestClassifier(featuresCol='features_clf',labelCol='churn',
+                            maxDepth=5,minInstancesPerNode=round(df_pyspark.count()*0.1))
+model=rf.fit(train_data)
+predictions=model.transform(test_data)
+evaluator=MulticlassClassificationEvaluator(labelCol='churn',predictionCol='prediction',metricName='accuracy')
+multiclass_metrics=['accuracy','weightedRecall','weightedPrecision','f1']
+
+for metric in multiclass_metrics:
+    result=evaluator.evaluate(predictions,{evaluator.metricName: metric})
+    print(f'Metric {metric}: {result}')
+    
+evaluator=BinaryClassificationEvaluator(labelCol='churn',rawPredictionCol='prediction')
+binary_metrics=['areaUnderROC','areaUnderPR']
+print('\n')
+for metric in binary_metrics:
+    result=evaluator.evaluate(predictions,{evaluator.metricName: metric})
+    print(f'Binary {metric}: {result:.4f}')
+
+#GBTClassifier
+gbt=GBTClassifier(featuresCol='features_clf',labelCol='churn',
+                            maxDepth=5,minInstancesPerNode=round(df_pyspark.count()*0.01))
+model=gbt.fit(train_data)
+predictions=model.transform(test_data)
+evaluator=MulticlassClassificationEvaluator(labelCol='churn',predictionCol='prediction',metricName='accuracy')
+multiclass_metrics=['accuracy','weightedRecall','weightedPrecision','f1']
+
+for metric in multiclass_metrics:
+    result=evaluator.evaluate(predictions,{evaluator.metricName: metric})
+    print(f'Metric {metric}: {result}')
+    
+evaluator=BinaryClassificationEvaluator(labelCol='churn',rawPredictionCol='prediction')
+binary_metrics=['areaUnderROC','areaUnderPR']
+print('\n')
+for metric in binary_metrics:
+    result=evaluator.evaluate(predictions,{evaluator.metricName: metric})
+    print(f'Binary {metric}: {result:.4f}')
+
+#Naive Bayes
+nb = NaiveBayes(featuresCol='features_clf', labelCol='churn')
+model=nb.fit(train_data)
+
+predictions=model.transform(test_data)
+evaluator=MulticlassClassificationEvaluator(labelCol='churn',predictionCol='prediction',metricName='accuracy')
+multiclass_metrics=['accuracy','weightedRecall','weightedPrecision','f1']
+
+for metric in multiclass_metrics:
+    result=evaluator.evaluate(predictions,{evaluator.metricName: metric})
+    print(f'Metric {metric}: {result}')
+    
+evaluator=BinaryClassificationEvaluator(labelCol='churn',rawPredictionCol='prediction')
+binary_metrics=['areaUnderROC','areaUnderPR']
+print('\n')
+for metric in binary_metrics:
+    result=evaluator.evaluate(predictions,{evaluator.metricName: metric})
+    print(f'Binary {metric}: {result:.4f}')
+labelIndexer=StringIndexer(inputCol='churn',outputCol='churn_index').fit(df_pyspark)
+df_pyspark=labelIndexer.transform(df_pyspark)
+
+labelIndexer_state=StringIndexer(inputCol='state',outputCol='state_index').fit(df_pyspark)
+df_pyspark=labelIndexer_state.transform(df_pyspark)
+
+listcol=[x for x in df_pyspark.columns if re.compile('^._calls|_mins|_charge').search(x)]
+listcol=list(np.append(listcol,'state_index'))
+featureassembler=VectorAssembler(inputCols=listcol,outputCol='features_clf')
+df_pyspark=featureassembler.transform(df_pyspark)
+
+
+(train_data,test_data)=df_pyspark.randomSplit([0.7,0.3],seed=42)
+nb = NaiveBayes(featuresCol='features_clf', labelCol='churn_index')
+
+model=nb.fit(train_data)
+predictions=model.transform(test_data)
+evaluator=MulticlassClassificationEvaluator(labelCol='churn_index',predictionCol='prediction',metricName='accuracy')
+multiclass_metrics=['accuracy','weightedRecall','weightedPrecision','f1']
+
+for metric in multiclass_metrics:
+    result=evaluator.evaluate(predictions,{evaluator.metricName: metric})
+    print(f'Metric {metric}: {result}')
+    
+evaluator=BinaryClassificationEvaluator(labelCol='churn_index',rawPredictionCol='prediction')
+binary_metrics=['areaUnderROC','areaUnderPR']
+print('\n')
+for metric in binary_metrics:
+    result=evaluator.evaluate(predictions,{evaluator.metricName: metric})
+    print(f'Binary {metric}: {result:.4f}')
+
+labelconv=IndexToString(inputCol="prediction", outputCol="churn_pred",labels=labelIndexer.labels)
+labelconv.transform(predictions).toPandas()
+
+#K-Means
+col=[item[0] for item in df_pyspark.dtypes if not(item[1].startswith('string'))]
+
+featureassembler=VectorAssembler(inputCols=col,outputCol='features_clust')
+df_pyspark=featureassembler.transform(df_pyspark)
+
+sil=[]
+for k in range(5,10):
+    kmeans=KMeans().setK(k).setSeed(42).setFeaturesCol('features_clust').setPredictionCol('cluster')
+    model=kmeans.fit(df_pyspark)
+    predictions=model.transform(df_pyspark)
+    evaluator=ClusteringEvaluator(featuresCol='features_clust',predictionCol='cluster')
+    silhouette=evaluator.evaluate(predictions)
+    sil.append(silhouette)
+
+
+sil=[]
+for k in range(5,10):
+    gmm=GaussianMixture(k=k,seed=42,featuresCol='features_clust',predictionCol='cluster')
+    model=gmm.fit(df_pyspark)
+    predictions=model.transform(df_pyspark)
+    evaluator=ClusteringEvaluator(featuresCol='features_clust',predictionCol='cluster')
+    silhouette=evaluator.evaluate(predictions)
+    sil.append(silhouette)
+
