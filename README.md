@@ -1,0 +1,2 @@
+# Customer-Churn-in-the-Telco-Industry-using-PySpark
+It is an Exploratory Data Analysis (EDA) project in the Telco industry using PySpark. I created Key Performance Indicators (KPIs) to further analyze and measure the performance of the Telco operations. Additionally, I implemented Principal Component Analysis (PCA) and machine learning algorithms to predict customer churn and estimate the expected time consumption in Telco devices.
